@@ -56,7 +56,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Run unit tests
-        run: pytest -q
+        run: python -m pytest -q
       - id: scope
         shell: bash
         run: |
