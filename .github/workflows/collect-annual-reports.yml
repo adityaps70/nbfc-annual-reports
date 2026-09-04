@@ -1,0 +1,181 @@
+name: Collect annual reports
+
+on:
+  workflow_dispatch:
+    inputs:
+      company:
+        description: Optional exact company name; leave blank for the normal matrix
+        required: false
+        default: ''
+        type: string
+      start_fy:
+        description: Starting financial year (2011 means FY2011-12)
+        required: true
+        default: '2011'
+        type: string
+      full_run:
+        description: Process all 215 companies
+        required: true
+        default: false
+        type: boolean
+  push:
+    branches:
+      - main
+      - 'implementation/**'
+    paths:
+      - 'collector/**'
+      - 'scripts/**'
+      - 'companies.txt'
+      - 'requirements.txt'
+      - '.github/workflows/collect-annual-reports.yml'
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: annual-report-collector-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: annual-reports-archive
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  prepare:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      start_fy: ${{ steps.scope.outputs.start_fy }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run unit tests
+        run: pytest -q
+      - id: scope
+        shell: bash
+        run: |
+          START_FY="${{ github.event.inputs.start_fy }}"
+          echo "start_fy=${START_FY:-2011}" >> "$GITHUB_OUTPUT"
+      - id: matrix
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.company }}" ]]; then
+            MATRIX=$(python scripts/build_matrix.py companies.txt --only "${{ github.event.inputs.company }}")
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.full_run }}" == "true" ]]; then
+            MATRIX=$(python scripts/build_matrix.py companies.txt)
+          elif [[ "${{ github.ref_name }}" == "main" ]]; then
+            MATRIX=$(python scripts/build_matrix.py companies.txt)
+          else
+            MATRIX=$(python scripts/build_matrix.py companies.txt --only "Aavas Financiers Ltd.;Abhishek Finlease Ltd.;Acme Resources Ltd.")
+          fi
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+      - name: Ensure durable GitHub release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --title "Annual Reports Archive" --notes "Per-company annual report ZIP archives collected by GitHub Actions."
+
+  collect:
+    needs: prepare
+    if: needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Collect one company with a hard wall-clock limit
+        id: collect
+        continue-on-error: true
+        env:
+          COMPANY: ${{ matrix.company }}
+          SLUG: ${{ matrix.slug }}
+        shell: bash
+        run: |
+          mkdir -p manifests work
+          set +e
+          timeout 180s python -m collector.collect_company \
+            --company "$COMPANY" \
+            --output-dir work \
+            --start-fy "${{ needs.prepare.outputs.start_fy }}" \
+            --budget-seconds 165 \
+            --manifest "manifests/${SLUG}.json"
+          RC=$?
+          export RC
+          set -e
+          if [[ ! -s "manifests/${SLUG}.json" ]]; then
+            python - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+          company=os.environ['COMPANY']; slug=os.environ['SLUG']
+          data={"company":company,"matched_name":"","status":"TIMEOUT" if os.environ.get('RC','124')=='124' else "ERROR","started_at":"","finished_at":datetime.now(timezone.utc).isoformat(),"reports":[],"errors":["outer timeout/failure prevented collector manifest"],"archive_path":"","archive_asset":f"{slug}.zip"}
+          open(f"manifests/{slug}.json","w",encoding="utf-8").write(json.dumps(data,indent=2))
+          PY
+          fi
+          exit 0
+      - name: Upload report ZIP to durable GitHub Release
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          ASSET=$(find work -maxdepth 1 -name '*.zip' -print -quit || true)
+          if [[ -n "$ASSET" ]]; then
+            gh release upload "$RELEASE_TAG" "$ASSET" --clobber
+          fi
+      - name: Upload per-company manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-${{ matrix.slug }}
+          path: manifests/${{ matrix.slug }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+  merge:
+    needs: [prepare, collect]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download manifests
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: manifest-*
+          path: manifests
+          merge-multiple: true
+      - name: Rebuild indexes
+        run: python scripts/merge_results.py --manifests manifests --results results --run-id "${{ github.run_id }}"
+      - name: Commit durable indexes back to the triggering branch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results/master_index.csv results/missing_reports.csv results/progress.json
+          if git diff --cached --quiet; then
+            echo "No result changes to commit"
+          else
+            git commit -m "chore: update annual report indexes [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
